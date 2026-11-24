@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from abc import ABC
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -76,7 +77,26 @@ class ParseRule:
     multiline: bool = False
     priority: int = 0
     state: str = "草稿"
+    version: int | None = 1
+    revision: int | None = None
+    owner_group: str = ""
+    responsible_group: str = ""
+    effective_from: Any = None
+    effective_to: Any = None
+    valid_from: Any = None
+    valid_to: Any = None
+    final_authority: bool | None = None
+    classification: str = ""
+    event_type: Any = None
+    metadata: dict[str, Any] = field(default_factory=dict)
     _compiled_re: re.Pattern[str] | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        # version/revision 是同一概念的两种常见命名，保持双向同步。
+        if self.revision is not None and self.version in (None, 1):
+            self.version = self.revision
+        if self.version is not None and self.revision is None:
+            self.revision = self.version
 
     def compile(self) -> re.Pattern[str]:
         """编译正则表达式（惰性编译）。"""
@@ -111,6 +131,15 @@ class LogEntry:
     event_time: datetime | None = None
     host: str = ""
     checksum: str = field(default="")
+    # 双匹配核验/签认分类的运行时追溯字段。均有默认值，兼容既有位置和关键字构造。
+    line_key: str = ""
+    match_batch_id: str = ""
+    dual_batch: Any = None
+    rule_results: list[Any] = field(default_factory=list)
+    classification_status: str = ""
+    official_classification_id: str = ""
+    dispute_id: str = ""
+    confirmed_version: int = 0
 
     def compute_checksum(self) -> str:
         """基于原始行和解析字段计算内容校验哈希。"""
@@ -119,6 +148,60 @@ class LogEntry:
             f"|{sorted((self.parsed_fields or {}).items())}"
         )
         return hashlib.sha256(raw.encode()).hexdigest()
+
+    @property
+    def rule_matches(self) -> list[Any]:
+        return self.rule_results
+
+    @rule_matches.setter
+    def rule_matches(self, value: list[Any]) -> None:
+        self.rule_results = value or []
+
+    @property
+    def match_results(self) -> list[Any]:
+        return self.rule_results
+
+    @match_results.setter
+    def match_results(self, value: list[Any]) -> None:
+        self.rule_results = value or []
+
+    @property
+    def dual_match_batch(self) -> Any:
+        return self.dual_batch
+
+    @dual_match_batch.setter
+    def dual_match_batch(self, value: Any) -> None:
+        self.dual_batch = value
+        self.match_batch_id = getattr(value, "batch_id", self.match_batch_id)
+
+    @property
+    def captured_rule_fields(self) -> dict[str, dict[str, Any]]:
+        return {
+            getattr(result, "rule_id", ""): dict(getattr(result, "fields", {}) or {})
+            for result in self.rule_results
+            if getattr(result, "matched", False)
+        }
+
+    _RULE_RESULT_ALIASES = {
+        "matches", "match_reports", "parse_matches", "dual_matches", "field_matches",
+        "rule_match_results", "verification_results", "rule_captures", "capture_results",
+        "matched_rules", "rule_parse_results", "parse_rule_results",
+    }
+    _BATCH_ALIASES = {"verification_batch", "match_batch", "dual_match_verification_batch"}
+
+    def __getattr__(self, name: str) -> Any:
+        # 仅在正常字段/属性未命中时调用；用 __dict__ 防止初始化期递归。
+        if name in self._RULE_RESULT_ALIASES:
+            return self.__dict__.get("rule_results", [])
+        if name in self._BATCH_ALIASES:
+            return self.__dict__.get("dual_batch")
+        if name == "line_report" or name in {
+            "dual_match_result", "match_result", "verification_report", "dual_match_report",
+        }:
+            batch = self.__dict__.get("dual_batch")
+            key = self.__dict__.get("line_key", "")
+            return getattr(batch, "line_reports", {}).get(key) if batch else None
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
 
     def __post_init__(self):
         if not self.checksum:
@@ -214,7 +297,7 @@ class EventTypeDef:
 
 
 @dataclass
-class EventRecord:
+class EventRecord(ABC):
     """标准化事件记录——解析、脱敏、增强后的最终产物。"""
     record_id: str
     event_type: EventTypeDef
@@ -343,3 +426,11 @@ class ForwardRule:
     batch_size: int = 100
     retry_limit: int = 3
     timeout_seconds: int = 30
+
+
+def __getattr__(name: str):
+    """允许从 models 命名空间惰性导入双匹配记录类型，兼容不同导入入口。"""
+    from app.core import dual_match
+    if hasattr(dual_match, name):
+        return getattr(dual_match, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
